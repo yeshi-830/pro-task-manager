@@ -1,6 +1,17 @@
-@tailwind base;
-@tailwind components;
-@tailwind utilities;
+@import "tailwindcss";
+
+@theme {
+  --font-sans: Inter, ui-sans-serif, system-ui, sans-serif;
+  --color-ink: #202238;
+  --color-muted: #85869a;
+  --color-canvas: #f7f8fc;
+  --color-violet-50: #f1efff;
+  --color-violet-100: #e6e2ff;
+  --color-violet-500: #7565e8;
+  --color-violet-600: #6554d8;
+  --color-violet-700: #5545c1;
+  --shadow-soft: 0 8px 30px rgba(36, 35, 68, 0.055);
+}
 
 :root {
   font-family: Inter, ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont,
