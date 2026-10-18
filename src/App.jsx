@@ -125,6 +125,9 @@ function App() {
   const [newTaskTitle, setNewTaskTitle] = useState("");
   const [newTaskProject, setNewTaskProject] = useState(initialProjects[0].name);
   const [newTaskPriority, setNewTaskPriority] = useState("Medium");
+  const [newTaskDue, setNewTaskDue] = useState(
+  new Date().toLocaleDateString("en-CA")
+);
   const [notice, setNotice] = useState("");
 
   useEffect(() => {
@@ -211,7 +214,7 @@ function App() {
         title,
         project: newTaskProject,
         projectColor: projectColors[newTaskProject] || "violet",
-        due: "Today",
+       due: newTaskDue,
         priority: newTaskPriority,
         completed: false,
       },
@@ -219,6 +222,7 @@ function App() {
     ]);
     setNewTaskTitle("");
     setNewTaskPriority("Medium");
+    
     setShowForm(false);
     setNotice("Your task has been added.");
   }
