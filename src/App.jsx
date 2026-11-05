@@ -1,5 +1,7 @@
 
 import { useEffect, useMemo, useRef, useState } from "react";
+import AuthPage from "./AuthPage.jsx";
+import { api } from "./api.js";
 
 const initialProjects = [
   { name: "Website redesign", color: "violet" },
@@ -50,6 +52,7 @@ function Icon({ name, size = 19, className = "" }) {
     arrow: <path d="M5 12h14m-6-6 6 6-6 6"/>,
     clock: <><circle cx="12" cy="12" r="9"/><path d="M12 7v5l3 2"/></>,
     flag: <><path d="M5 21V4"/><path d="M5 4h13l-3 4 3 4H5"/></>,
+    logout: <><path d="M10 17l5-5-5-5"/><path d="M15 12H3"/><path d="M12 3h6a2 2 0 0 1 2 2v14a2 2 0 0 1-2 2h-6"/></>,
   };
 
   return (
@@ -70,15 +73,71 @@ function Icon({ name, size = 19, className = "" }) {
   );
 }
 
-function loadSaved(key, fallback) {
-  try {
-    const saved = localStorage.getItem(key);
-    if (!saved) return fallback;
-    const parsed = JSON.parse(saved);
-    return Array.isArray(parsed) ? parsed : fallback;
-  } catch {
-    return fallback;
+export default function App() {
+  const [session, setSession] = useState(null);
+  const [status, setStatus] = useState("loading");
+  const [connectionError, setConnectionError] = useState("");
+
+  async function restoreSession() {
+    setStatus("loading");
+    setConnectionError("");
+    try {
+      const account = await api.me();
+      const preferredWorkspace = account.workspaces.find(
+        (workspace) => workspace.id === api.getWorkspaceId(),
+      ) || account.workspaces[0];
+      api.setWorkspaceId(preferredWorkspace?.id);
+      setSession({
+        ...account,
+        activeWorkspaceId: preferredWorkspace?.id || "",
+      });
+      setStatus("ready");
+    } catch (error) {
+      if (error.status === 401) {
+        setSession(null);
+        setStatus("signed-out");
+      } else {
+        setConnectionError(error.message);
+        setStatus("error");
+      }
+    }
   }
+
+  useEffect(() => {
+    restoreSession();
+  }, []);
+
+  if (status === "loading") {
+    return (
+      <main className="flex min-h-screen items-center justify-center bg-slate-50 text-sm font-medium text-slate-500">
+        Connecting to your workspace...
+      </main>
+    );
+  }
+
+  if (status === "error") {
+    return (
+      <main className="flex min-h-screen flex-col items-center justify-center gap-4 bg-slate-50 px-4 text-center">
+        <p role="alert" className="text-sm text-slate-600">{connectionError}</p>
+        <Button onClick={restoreSession} variant="primary">Try again</Button>
+      </main>
+    );
+  }
+
+  if (!session) {
+    return <AuthPage onAuthenticated={(account) => { setSession(account); setStatus("ready"); }}/>;
+  }
+
+  return (
+    <TaskManager
+      key={session.activeWorkspaceId}
+      session={session}
+      onSessionChange={(nextSession) => {
+        setSession(nextSession);
+        setStatus(nextSession ? "ready" : "signed-out");
+      }}
+    />
+  );
 }
 
 function localDate(date = new Date()) {
@@ -184,29 +243,29 @@ function StatCard({ label, value, detail, icon, color, onClick }) {
   );
 }
 
-export default function App() {
-  const [projects, setProjects] = useState(() =>
-    loadSaved("daymark-projects", initialProjects)
-  );
-
-  const [tasks, setTasks] = useState(() => {
-    const saved = loadSaved("daymark-tasks", initialTasks);
-    const savedProjects = loadSaved("daymark-projects", initialProjects);
-    return saved.map((task) => normalizeTask(task, savedProjects));
-  });
+function TaskManager({ session, onSessionChange }) {
+  const [projects, setProjects] = useState([]);
+  const [tasks, setTasks] = useState([]);
+  const [stats, setStats] = useState({ total: 0, completed: 0, today: 0, upcoming: 0, overdue: 0, high_priority: 0 });
+  const [isLoading, setIsLoading] = useState(true);
+  const [isLoadingMore, setIsLoadingMore] = useState(false);
+  const [hasMoreTasks, setHasMoreTasks] = useState(false);
+  const [taskOffset, setTaskOffset] = useState(0);
+  const [matchingTaskCount, setMatchingTaskCount] = useState(0);
+  const [refreshKey, setRefreshKey] = useState(0);
 
   const [activeView, setActiveView] = useState("My tasks");
   const [selectedProject, setSelectedProject] = useState(null);
+  const [selectedProjectId, setSelectedProjectId] = useState(null);
   const [search, setSearch] = useState("");
+  const [debouncedSearch, setDebouncedSearch] = useState("");
   const [showSearch, setShowSearch] = useState(false);
   const [showForm, setShowForm] = useState(false);
   const [showProjectForm, setShowProjectForm] = useState(false);
   const [showDashboard, setShowDashboard] = useState(true);
 
   const [newTaskTitle, setNewTaskTitle] = useState("");
-  const [newTaskProject, setNewTaskProject] = useState(
-    () => loadSaved("daymark-projects", initialProjects)[0]?.name || ""
-  );
+  const [newTaskProject, setNewTaskProject] = useState("");
   const [newTaskPriority, setNewTaskPriority] = useState("Medium");
   const [newTaskDue, setNewTaskDue] = useState(localDate());
 
@@ -223,20 +282,43 @@ export default function App() {
   const importRef = useRef(null);
 
   useEffect(() => {
-    try {
-      localStorage.setItem("daymark-tasks", JSON.stringify(tasks));
-    } catch {
-      setNotice("Unable to save tasks. Your browser storage may be full.");
-    }
-  }, [tasks]);
+    const timer = window.setTimeout(() => setDebouncedSearch(search.trim()), 250);
+    return () => window.clearTimeout(timer);
+  }, [search]);
 
   useEffect(() => {
-    try {
-      localStorage.setItem("daymark-projects", JSON.stringify(projects));
-    } catch {
-      setNotice("Unable to save projects. Your browser storage may be full.");
-    }
-  }, [projects]);
+    let cancelled = false;
+    const params = {
+      view: activeView,
+      sort: sortBy,
+      today: localDate(),
+      limit: "50",
+      offset: "0",
+    };
+    if (selectedProjectId) params.projectId = selectedProjectId;
+    if (debouncedSearch) params.q = debouncedSearch;
+    if (filterPriority !== "All") params.priority = filterPriority;
+
+    setIsLoading(true);
+    Promise.all([api.projects(), api.stats(localDate()), api.tasks(params)])
+      .then(([projectResult, statsResult, taskResult]) => {
+        if (cancelled) return;
+        setProjects(projectResult.items);
+        setStats(statsResult);
+        setTasks(taskResult.items);
+        setTaskOffset(taskResult.items.length);
+        setMatchingTaskCount(taskResult.pagination.total);
+        setHasMoreTasks(taskResult.pagination.hasMore);
+      })
+      .catch((error) => {
+        if (!cancelled) setNotice(error.message);
+      })
+      .finally(() => {
+        if (!cancelled) setIsLoading(false);
+      });
+
+    return () => { cancelled = true; };
+  }, [activeView, debouncedSearch, filterPriority, refreshKey, selectedProjectId, sortBy]);
 
   useEffect(() => {
     if (!notice) return undefined;
@@ -244,12 +326,12 @@ export default function App() {
     return () => window.clearTimeout(timer);
   }, [notice]);
 
-  const completedCount = tasks.filter((task) => task.completed).length;
-  const activeCount = tasks.length - completedCount;
-  const todayCount = tasks.filter((task) => isTaskDueToday(task) && !task.completed).length;
-  const overdueCount = tasks.filter(isTaskOverdue).length;
-  const highPriorityCount = tasks.filter((task) => task.priority === "High" && !task.completed).length;
-  const completionRate = tasks.length ? Math.round((completedCount / tasks.length) * 100) : 0;
+  const completedCount = stats.completed;
+  const activeCount = stats.total - stats.completed;
+  const todayCount = stats.today;
+  const overdueCount = stats.overdue;
+  const highPriorityCount = stats.high_priority;
+  const completionRate = stats.total ? Math.round((completedCount / stats.total) * 100) : 0;
 
   const todayLabel = new Intl.DateTimeFormat("en-US", {
     weekday: "long",
@@ -341,7 +423,7 @@ export default function App() {
     setShowForm(true);
   }
 
-  function saveTask(event) {
+  async function saveTask(event) {
     event.preventDefault();
 
     const title = newTaskTitle.trim();
@@ -356,50 +438,55 @@ export default function App() {
       return;
     }
 
-    const projectColor = projectColors[newTaskProject] || "violet";
-
-    if (editingTaskId !== null) {
-      setTasks((current) => current.map((task) =>
-        task.id === editingTaskId
-          ? { ...task, title, project: newTaskProject, projectColor, due: newTaskDue, priority: newTaskPriority }
-          : task
-      ));
-      setNotice("Task updated successfully.");
-    } else {
-      setTasks((current) => [
-        {
-          id: Date.now(),
-          title,
-          project: newTaskProject,
-          projectColor,
-          due: newTaskDue,
-          priority: newTaskPriority,
-          completed: false,
-        },
-        ...current,
-      ]);
-      setNotice("Task created successfully.");
+    const project = projects.find((item) => item.name === newTaskProject);
+    if (!project) {
+      setNotice("Select a project in this workspace.");
+      return;
     }
 
-    setShowForm(false);
-    setEditingTaskId(null);
+    try {
+      const task = {
+        title,
+        projectId: project.id,
+        due: newTaskDue,
+        priority: newTaskPriority,
+      };
+      if (editingTaskId !== null) await api.updateTask(editingTaskId, task);
+      else await api.createTask(task);
+      setRefreshKey((value) => value + 1);
+      setNotice(editingTaskId !== null ? "Task updated successfully." : "Task created successfully.");
+      setShowForm(false);
+      setEditingTaskId(null);
+    } catch (error) {
+      setNotice(error.message);
+    }
   }
 
-  function toggleTask(taskId) {
-    setTasks((current) => current.map((task) =>
-      task.id === taskId ? { ...task, completed: !task.completed } : task
-    ));
+  async function toggleTask(taskId) {
+    const task = tasks.find((item) => item.id === taskId);
+    if (!task) return;
+    try {
+      await api.updateTask(taskId, { completed: !task.completed });
+      setRefreshKey((value) => value + 1);
+    } catch (error) {
+      setNotice(error.message);
+    }
   }
 
-  function deleteTask(taskId) {
+  async function deleteTask(taskId) {
     if (!window.confirm("Delete this task? This action cannot be undone.")) return;
 
-    setTasks((current) => current.filter((task) => task.id !== taskId));
-    setSelectedIds((current) => current.filter((id) => id !== taskId));
-    setNotice("Task deleted.");
+    try {
+      await api.deleteTask(taskId);
+      setSelectedIds((current) => current.filter((id) => id !== taskId));
+      setRefreshKey((value) => value + 1);
+      setNotice("Task deleted.");
+    } catch (error) {
+      setNotice(error.message);
+    }
   }
 
-  function createProject(event) {
+  async function createProject(event) {
     event.preventDefault();
     const name = newProjectName.trim();
 
@@ -413,14 +500,21 @@ export default function App() {
       return;
     }
 
-    setProjects((current) => [...current, { name, color: newProjectColor }]);
-    setNewTaskProject(name);
-    setNewProjectName("");
-    setNewProjectColor("violet");
-    setShowProjectForm(false);
-    setSelectedProject(name);
-    setActiveView("My tasks");
-    setNotice("Project created successfully.");
+    try {
+      const project = await api.createProject({ name, color: newProjectColor });
+      setProjects((current) => [...current, project]);
+      setNewTaskProject(name);
+      setNewProjectName("");
+      setNewProjectColor("violet");
+      setShowProjectForm(false);
+      setSelectedProject(name);
+      setSelectedProjectId(project.id);
+      setActiveView("My tasks");
+      setRefreshKey((value) => value + 1);
+      setNotice("Project created successfully.");
+    } catch (error) {
+      setNotice(error.message);
+    }
   }
 
   function toggleSelected(taskId) {
@@ -442,46 +536,54 @@ export default function App() {
     );
   }
 
-  function bulkComplete() {
+  async function bulkComplete() {
     if (!selectedIds.length) return;
 
-    setTasks((current) => current.map((task) =>
-      selectedIds.includes(task.id) ? { ...task, completed: true } : task
-    ));
-    setSelectedIds([]);
-    setNotice("Selected tasks marked as completed.");
+    try {
+      for (let index = 0; index < selectedIds.length; index += 100) {
+        await api.updateTasks(selectedIds.slice(index, index + 100), true);
+      }
+      setSelectedIds([]);
+      setRefreshKey((value) => value + 1);
+      setNotice("Selected tasks marked as completed.");
+    } catch (error) {
+      setNotice(error.message);
+    }
   }
 
-  function bulkDelete() {
+  async function bulkDelete() {
     if (!selectedIds.length) return;
 
     if (!window.confirm(`Delete ${selectedIds.length} selected task(s)? This cannot be undone.`)) return;
 
-    setTasks((current) => current.filter((task) => !selectedIds.includes(task.id)));
-    setSelectedIds([]);
-    setNotice("Selected tasks deleted.");
+    try {
+      for (let index = 0; index < selectedIds.length; index += 100) {
+        await api.deleteTasks(selectedIds.slice(index, index + 100));
+      }
+      setSelectedIds([]);
+      setRefreshKey((value) => value + 1);
+      setNotice("Selected tasks deleted.");
+    } catch (error) {
+      setNotice(error.message);
+    }
   }
 
-  function exportTasks() {
-    const backup = {
-      app: "Daymark Pro",
-      version: 1,
-      exportedAt: new Date().toISOString(),
-      tasks,
-      projects,
-    };
-
-    const blob = new Blob([JSON.stringify(backup, null, 2)], { type: "application/json" });
-    const url = URL.createObjectURL(blob);
-    const link = document.createElement("a");
-
-    link.href = url;
-    link.download = `daymark-backup-${localDate()}.json`;
-    document.body.appendChild(link);
-    link.click();
-    link.remove();
-    URL.revokeObjectURL(url);
-    setNotice("Backup exported successfully.");
+  async function exportTasks() {
+    try {
+      const backup = await api.exportData();
+      const blob = new Blob([JSON.stringify(backup, null, 2)], { type: "application/json" });
+      const url = URL.createObjectURL(blob);
+      const link = document.createElement("a");
+      link.href = url;
+      link.download = `daymark-backup-${localDate()}.json`;
+      document.body.appendChild(link);
+      link.click();
+      link.remove();
+      URL.revokeObjectURL(url);
+      setNotice("Backup exported successfully.");
+    } catch (error) {
+      setNotice(error.message);
+    }
   }
 
   async function importTasks(event) {
@@ -513,46 +615,132 @@ export default function App() {
 
       const importedTasks = backup.tasks
         .filter((task) => task && typeof task.title === "string" && task.title.trim())
-        .map((task, index) => normalizeTask(
-          { ...task, id: Date.now() + index + Math.random() },
-          uniqueProjects
-        ));
+        .map((task) => {
+          const normalized = normalizeTask(task, uniqueProjects);
+          const due = getDueDate(normalized.due);
+          return {
+            title: normalized.title,
+            project: normalized.project,
+            due: isISODate(due) ? due : localDate(),
+            priority: normalized.priority,
+            completed: normalized.completed,
+          };
+        });
 
       if (!window.confirm(`Replace your current data with ${importedTasks.length} tasks and ${uniqueProjects.length} projects from this backup? Export your current data first if you want to keep it.`)) {
         event.target.value = "";
         return;
       }
 
-      setProjects(uniqueProjects);
-      setTasks(importedTasks);
+      await api.importData({ projects: uniqueProjects, tasks: importedTasks });
       setSelectedIds([]);
       setSelectedProject(null);
+      setSelectedProjectId(null);
       setActiveView("My tasks");
+      setRefreshKey((value) => value + 1);
       setNotice("Backup imported successfully.");
-    } catch {
-      setNotice("Could not import this file. Please choose a valid Daymark JSON backup.");
+    } catch (error) {
+      setNotice(error instanceof SyntaxError
+        ? "Could not import this file. Please choose a valid Daymark JSON backup."
+        : error.message);
     } finally {
       event.target.value = "";
     }
   }
 
-  function resetDemoData() {
+  async function resetDemoData() {
     if (!window.confirm("Restore the original demo tasks and projects? Your current data will be replaced.")) return;
 
-    setProjects(initialProjects);
-    setTasks(initialTasks.map((task) => ({ ...task })));
-    setSelectedIds([]);
-    setSelectedProject(null);
-    setActiveView("My tasks");
-    setFilterPriority("All");
-    setSearch("");
-    setNotice("Demo data restored.");
+    try {
+      await api.importData({
+        projects: initialProjects,
+        tasks: initialTasks.map((task) => ({
+          title: task.title,
+          project: task.project,
+          due: getDueDate(task.due),
+          priority: task.priority,
+          completed: task.completed,
+        })),
+      });
+      setSelectedIds([]);
+      setSelectedProject(null);
+      setSelectedProjectId(null);
+      setActiveView("My tasks");
+      setFilterPriority("All");
+      setSearch("");
+      setRefreshKey((value) => value + 1);
+      setNotice("Demo data restored.");
+    } catch (error) {
+      setNotice(error.message);
+    }
   }
 
-  function navigate(view, project = null) {
+  function navigate(view, project = null, projectId = null) {
     setActiveView(view);
     setSelectedProject(project);
+    setSelectedProjectId(projectId);
     setSelectedIds([]);
+  }
+
+  async function loadMoreTasks() {
+    const params = {
+      view: activeView,
+      sort: sortBy,
+      today: localDate(),
+      limit: "50",
+      offset: String(taskOffset),
+    };
+    if (selectedProjectId) params.projectId = selectedProjectId;
+    if (debouncedSearch) params.q = debouncedSearch;
+    if (filterPriority !== "All") params.priority = filterPriority;
+
+    setIsLoadingMore(true);
+    try {
+      const result = await api.tasks(params);
+      setTasks((current) => [...current, ...result.items]);
+      setTaskOffset((current) => current + result.items.length);
+      setMatchingTaskCount(result.pagination.total);
+      setHasMoreTasks(result.pagination.hasMore);
+    } catch (error) {
+      setNotice(error.message);
+    } finally {
+      setIsLoadingMore(false);
+    }
+  }
+
+  async function createWorkspace() {
+    const name = window.prompt("Name your new workspace:");
+    if (!name?.trim()) return;
+    try {
+      const workspace = await api.createWorkspace(name.trim());
+      const workspaces = [...session.workspaces, workspace];
+      api.setWorkspaceId(workspace.id);
+      onSessionChange({ ...session, workspaces, activeWorkspaceId: workspace.id });
+      setNotice("Workspace created.");
+    } catch (error) {
+      setNotice(error.message);
+    }
+  }
+
+  async function inviteMember() {
+    const email = window.prompt("Enter the email of someone with a Daymark account:");
+    if (!email?.trim()) return;
+    try {
+      const member = await api.addWorkspaceMember(session.activeWorkspaceId, email.trim());
+      setNotice(`${member.name} was added to the workspace.`);
+    } catch (error) {
+      setNotice(error.message);
+    }
+  }
+
+  async function signOut() {
+    try {
+      await api.logout();
+      api.setWorkspaceId(null);
+      onSessionChange(null);
+    } catch (error) {
+      setNotice(error.message);
+    }
   }
 
   const navItem = (label, icon, count) => {
@@ -577,6 +765,14 @@ export default function App() {
     );
   };
 
+  if (isLoading && !projects.length) {
+    return (
+      <main className="flex min-h-screen items-center justify-center bg-slate-50 text-sm font-medium text-slate-500">
+        Loading your workspace...
+      </main>
+    );
+  }
+
   return (
     <div className="min-h-screen bg-slate-50 text-slate-800">
       <div className="flex min-h-screen">
@@ -595,7 +791,7 @@ export default function App() {
           <nav className="space-y-1">
             {navItem("My tasks", "grid", activeCount)}
             {navItem("Today", "calendar", todayCount)}
-            {navItem("Upcoming", "clock", tasks.filter((task) => !task.completed && !isTaskDueToday(task)).length)}
+            {navItem("Upcoming", "clock", stats.upcoming)}
             {navItem("Completed", "check", completedCount)}
             {navItem("Overdue", "bell", overdueCount)}
           </nav>
@@ -610,15 +806,15 @@ export default function App() {
           <div className="space-y-1">
             {projects.map((project) => (
               <button
-                key={project.name}
-                onClick={() => navigate("My tasks", project.name)}
+                key={project.id}
+                onClick={() => navigate("My tasks", project.name, project.id)}
                 className={`flex w-full items-center gap-3 rounded-xl px-3 py-2.5 text-left text-sm transition ${
                   selectedProject === project.name ? "bg-violet-50 font-semibold text-violet-700" : "text-slate-600 hover:bg-slate-100"
                 }`}
               >
                 <span className={`h-2.5 w-2.5 rounded-full ${project.color === "violet" ? "bg-violet-500" : project.color === "blue" ? "bg-sky-500" : project.color === "orange" ? "bg-orange-500" : project.color === "green" ? "bg-emerald-500" : "bg-pink-500"}`}/>
                 <span className="flex-1 truncate">{project.name}</span>
-                <span className="text-xs text-slate-400">{tasks.filter((task) => task.project === project.name && !task.completed).length}</span>
+                <span className="text-xs text-slate-400">{project.activeTaskCount}</span>
               </button>
             ))}
             {!projects.length && <p className="px-3 py-2 text-sm text-slate-400">No projects yet.</p>}
@@ -644,17 +840,43 @@ export default function App() {
                   <Icon name="check" size={22}/>
                 </span>
                 <div className="min-w-0">
-                  <p className="truncate text-sm font-semibold text-slate-900 md:text-base">Good to see you!</p>
+                  <p className="truncate text-sm font-semibold text-slate-900 md:text-base">Good to see you, {session.user.name}!</p>
                   <p className="truncate text-xs text-slate-500">{todayLabel}</p>
                 </div>
               </div>
 
               <div className="flex shrink-0 items-center gap-2">
+                <label className="sr-only" htmlFor="active-workspace">Active workspace</label>
+                <select
+                  id="active-workspace"
+                  value={session.activeWorkspaceId}
+                  onChange={(event) => {
+                    api.setWorkspaceId(event.target.value);
+                    onSessionChange({ ...session, activeWorkspaceId: event.target.value });
+                  }}
+                  className="max-w-28 rounded-xl border border-slate-200 bg-white px-2 py-2.5 text-xs font-semibold text-slate-700 outline-none focus:border-violet-400 sm:max-w-40 sm:px-3 sm:text-sm"
+                  aria-label="Active workspace"
+                >
+                  {session.workspaces.map((workspace) => (
+                    <option key={workspace.id} value={workspace.id}>{workspace.name}</option>
+                  ))}
+                </select>
+                <Button onClick={createWorkspace} title="Create workspace" aria-label="Create workspace" className="!p-2.5">
+                  <Icon name="plus" size={18}/>
+                </Button>
+                {session.workspaces.find((workspace) => workspace.id === session.activeWorkspaceId)?.role === "owner" && (
+                  <Button onClick={inviteMember} title="Add a workspace member" aria-label="Add a workspace member" className="hidden !p-2.5 lg:inline-flex">
+                    <Icon name="plus" size={18}/>
+                  </Button>
+                )}
                 <Button onClick={() => { setShowSearch((value) => !value); setSearch(""); }} className="!p-2.5" aria-label="Toggle search">
                   <Icon name="search" size={18}/>
                 </Button>
                 <Button onClick={exportTasks} className="hidden sm:inline-flex">
                   <Icon name="download" size={17}/> Export
+                </Button>
+                <Button onClick={signOut} className="!p-2.5" aria-label="Sign out" title="Sign out">
+                  <Icon name="logout" size={18}/>
                 </Button>
                 <Button onClick={openNewTaskForm} variant="primary">
                   <Icon name="plus" size={18}/> <span className="hidden sm:inline">New task</span><span className="sm:hidden">New</span>
@@ -720,7 +942,9 @@ export default function App() {
               <div className="flex flex-col gap-4 border-b border-slate-100 p-4 sm:flex-row sm:items-center sm:justify-between sm:p-5">
                 <div>
                   <h2 className="font-bold text-slate-900">Task list</h2>
-                  <p className="mt-1 text-xs text-slate-500">{visibleTasks.length} task{visibleTasks.length === 1 ? "" : "s"} found</p>
+                  <p className="mt-1 text-xs text-slate-500">
+                    {hasMoreTasks ? `${visibleTasks.length} of ${matchingTaskCount}` : matchingTaskCount} task{matchingTaskCount === 1 ? "" : "s"} found
+                  </p>
                 </div>
 
                 <div className="flex flex-wrap items-center gap-2">
@@ -836,6 +1060,14 @@ export default function App() {
                   );
                 })}
 
+                {hasMoreTasks && (
+                  <div className="flex justify-center border-t border-slate-100 p-4">
+                    <Button onClick={loadMoreTasks} disabled={isLoadingMore}>
+                      {isLoadingMore ? "Loading..." : "Load more tasks"}
+                    </Button>
+                  </div>
+                )}
+
                 {visibleTasks.length === 0 && (
                   <div className="px-5 py-16 text-center">
                     <span className="mx-auto flex h-14 w-14 items-center justify-center rounded-2xl bg-violet-50 text-violet-600">
@@ -901,7 +1133,7 @@ export default function App() {
 
             <section className="mt-6 rounded-2xl border border-slate-200 bg-white p-5">
               <h3 className="font-bold text-slate-900">Backup and data</h3>
-              <p className="mt-1 text-sm leading-6 text-slate-500">Your tasks and projects are saved in this browser. Export a backup regularly so you can restore your work later.</p>
+              <p className="mt-1 text-sm leading-6 text-slate-500">Your tasks and projects are saved securely in your workspace database. Export a backup regularly so you can restore your work later.</p>
               <div className="mt-4 flex flex-wrap gap-2">
                 <Button onClick={exportTasks} variant="primary"><Icon name="download" size={17}/> Export backup</Button>
                 <Button onClick={() => importRef.current?.click()}><Icon name="upload" size={17}/> Import backup</Button>
